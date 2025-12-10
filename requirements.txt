@@ -4,3 +4,9 @@ scikit-learn
 matplotlib
 seaborn
 numpy
+st.markdown("""
+**Tip:** If you get encoding errors:
+- Open your CSV in Excel or Google Sheets
+- Save/Export as **CSV UTF-8 (Comma delimited)**
+- Re-upload
+""")
