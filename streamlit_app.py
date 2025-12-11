@@ -60,7 +60,25 @@ if uploaded_file is None:
 # Load data
 @st.cache_data
 def load_data(file):
-    return pd.read_csv(file)
+    try:
+        # First try the standard UTF-8
+        return pd.read_csv(file)
+    except UnicodeDecodeError:
+        # If that fails, rewind and try common alternative encodings
+        file.seek(0)
+        try:
+            return pd.read_csv(file, encoding='cp1252')  # Windows common
+        except UnicodeDecodeError:
+            file.seek(0)
+            try:
+                return pd.read_csv(file, encoding='latin1')  # Very permissive
+            except UnicodeDecodeError:
+                file.seek(0)
+                return pd.read_csv(file, encoding='iso-8859-1')  # Fallback
+    except Exception as e:
+        st.error(f"Error reading CSV: {e}")
+        st.stop()
+        )
 
 df = load_data(uploaded_file)
 st.success(f"✅ Loaded {len(df):,} patient records with {len(df.columns)} columns")
