@@ -183,3 +183,65 @@ with col2:
 st.download_button("Download Results", metrics_df.to_csv(), "results.csv")
 
 st.balloons()
+
+# After df = load_data(uploaded_file)
+
+# Detect where cancer data starts (column 'ID' or 'Radius_mean' etc.)
+cancer_start_idx = None
+for i, col in enumerate(df.columns):
+    if col in ['ID', 'Diagnosis', 'Radius_mean']:  # Markers for breast cancer data
+        cancer_start_idx = i
+        break
+
+if cancer_start_idx is not None:
+    st.info(f"Detected mixed data — keeping only admissions columns (first {cancer_start_idx})")
+    df = df.iloc[:, :cancer_start_idx]
+
+# Drop rows without Row_ID (cancer rows)
+df = df.dropna(subset=['Row_ID']).copy()
+
+# Fix column name typo
+if 'Patientt_ID' in df.columns:
+    df = df.rename(columns={'Patientt_ID': 'Patient_ID'})
+
+# Parse Admit_time and Disch_time
+def parse_datetime(date_str, year_col, default_time='00:00'):
+    if pd.isna(date_str) or pd.isna(year_col):
+        return pd.NaT
+    parts = str(date_str).split(' ')
+    date_part = parts[0]
+    time_part = parts[1] if len(parts) > 1 else default_time
+    try:
+        mm, dd, yy = date_part.split('/')
+        full_year = int(year_col)
+        dt_str = f"{mm.zfill(2)}/{dd.zfill(2)}/{full_year} {time_part}"
+        return pd.to_datetime(dt_str, format='%m/%d/%Y %H:%M', errors='coerce')
+    except:
+        return pd.NaT
+
+df['Admit_time'] = df.apply(lambda row: parse_datetime(row['Admitted_date'], row['Admitted_year'], '00:00'), axis=1)
+df['Disch_time'] = df.apply(lambda row: parse_datetime(row['Disch_date'], row['Disch_year'], '00:00'), axis=1)
+
+# Sort for readmission logic
+df = df.sort_values(['Patient_ID', 'Admit_time']).reset_index(drop=True)
+
+# Add readmitted_30days column
+df['readmitted_30days'] = 0
+
+for patient_id in df['Patient_ID'].unique():
+    patient_rows = df[df['Patient_ID'] == patient_id].index
+    for i in range(len(patient_rows) - 1):
+        current_idx = patient_rows[i]
+        next_idx = patient_rows[i + 1]
+        disch = df.loc[current_idx, 'Disch_time']
+        next_admit = df.loc[next_idx, 'Admit_time']
+        if pd.notna(disch) and pd.notna(next_admit):
+            days_diff = (next_admit - disch).days
+            if 0 < days_diff <= 30:
+                df.loc[current_idx, 'readmitted_30days'] = 1
+
+st.success(f"Cleaned data: {df.shape[0]} admissions, {df['readmitted_30days'].sum()} readmissions within 30 days")
+st.write("### Cleaned Data Preview", df.head(10))
+
+# Now continue with feature engineering and modeling on this cleaned df
+df_eng = engineer_features(df)  # Use your existing function
