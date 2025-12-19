@@ -2,6 +2,8 @@
 # Fully robust: handles messy CSVs, auto-detects patient ID, creates target, imputes NaN
 # Tested and working on Streamlit Cloud
 
+# streamlit_app.py - FINAL VERSION with PR Curve, Confusion Matrix & Full Metrics
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -14,9 +16,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_curve, auc
+from sklearn.metrics import (
+    roc_curve, auc, precision_recall_curve, average_precision_score,
+    confusion_matrix, classification_report
+)
 from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer  # Handles missing values
+from sklearn.impute import SimpleImputer
 
 # --------------------------------------------------------------
 st.set_page_config(page_title="Cancer Readmission Predictor", layout="wide")
@@ -86,7 +91,7 @@ df_raw = load_data(uploaded_file)
 st.success(f"Raw file loaded: {df_raw.shape[0]} rows × {df_raw.shape[1]} columns")
 
 # --------------------------------------------------------------
-# 3. Clean Mixed Data (Remove breast cancer columns)
+# 3. Clean Mixed Data
 # --------------------------------------------------------------
 cancer_markers = ['ID', 'Radius_mean', 'Texture_mean', 'Diagnosis']
 cancer_start_idx = None
@@ -96,7 +101,7 @@ for i, col in enumerate(df_raw.columns):
         break
 
 if cancer_start_idx is not None:
-    st.info(f"Mixed data detected — keeping only first {cancer_start_idx} columns (admissions)")
+    st.info(f"Mixed data detected — keeping only first {cancer_start_idx} columns")
     df = df_raw.iloc[:, :cancer_start_idx].copy()
 else:
     df = df_raw.copy()
@@ -115,13 +120,12 @@ for col in possible_id_cols:
         break
 
 if patient_id_col is None:
-    st.error("Could not find a patient identifier column (tried: Patient_ID, SUBJECT_ID, HADM_ID, etc.).")
+    st.error("Could not find patient identifier column.")
     st.stop()
 
 st.info(f"Using '{patient_id_col}' as patient identifier.")
 df = df.rename(columns={patient_id_col: 'Patient_ID'})
 
-# Parse dates
 def parse_admission_datetime(row, date_col, year_col):
     if pd.isna(row.get(date_col)) or pd.isna(row.get(year_col)):
         return pd.NaT
@@ -138,13 +142,10 @@ def parse_admission_datetime(row, date_col, year_col):
 df['Admit_time'] = df.apply(lambda row: parse_admission_datetime(row, 'Admitted_date', 'Admitted_year'), axis=1)
 df['Disch_time'] = df.apply(lambda row: parse_admission_datetime(row, 'Disch_date', 'Disch_year'), axis=1)
 
-# Drop rows with missing dates
 df = df.dropna(subset=['Admit_time', 'Disch_time', 'Patient_ID']).copy()
 
-# Sort by patient and admission time
 df = df.sort_values(['Patient_ID', 'Admit_time']).reset_index(drop=True)
 
-# Create readmitted_30days
 if 'readmitted_30days' not in df.columns:
     st.info("Generating 'readmitted_30days' column...")
     df['readmitted_30days'] = 0
@@ -193,7 +194,7 @@ df_final = engineer_features(df)
 st.write("### Final Data for Modeling", df_final.head())
 
 # --------------------------------------------------------------
-# 6. Modeling (with NaN imputation)
+# 6. Modeling with Imputation
 # --------------------------------------------------------------
 target = 'readmitted_30days'
 X = df_final.select_dtypes(include=[np.number]).drop(columns=[target, 'Patient_ID', 'Row_ID', 'Hadm_ID'], errors='ignore')
@@ -212,6 +213,7 @@ models = {
 
 results = {}
 predictions = {}
+full_metrics = {}
 
 st.header("Training Models")
 progress = st.progress(0)
@@ -224,10 +226,18 @@ for i, (name, model) in enumerate(models.items()):
             ('model', model)
         ])
         pipe.fit(X_train, y_train)
+        
+        y_pred = pipe.predict(X_test)
         y_prob = pipe.predict_proba(X_test)[:, 1]
+        
         fpr, tpr, _ = roc_curve(y_test, y_prob)
+        precision, recall, _ = precision_recall_curve(y_test, y_prob)
+        
         results[name] = {'AUC': auc(fpr, tpr)}
-        predictions[name] = y_prob
+        predictions[name] = {'prob': y_prob, 'pred': y_pred, 'fpr': fpr, 'tpr': tpr, 'precision': precision, 'recall': recall}
+        
+        full_metrics[name] = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+    
     progress.progress((i + 1) / len(models))
 
 st.success("All models trained!")
@@ -235,40 +245,73 @@ st.success("All models trained!")
 # --------------------------------------------------------------
 # 7. Results & Visualizations
 # --------------------------------------------------------------
-st.header("Model Performance")
-metrics_df = pd.DataFrame(results).T.round(3)
+st.header("Model Performance Summary")
+metrics_df = pd.DataFrame({name: {
+    'AUC': results[name]['AUC'],
+    'Accuracy': full_metrics[name]['accuracy'],
+    'Precision': full_metrics[name]['1']['precision'],
+    'Recall': full_metrics[name]['1']['recall'],
+    'F1': full_metrics[name]['1']['f1-score']
+} for name in models}).T.round(4)
+
 st.dataframe(metrics_df.style.highlight_max(axis=0))
 
-best = metrics_df['AUC'].idxmax()
-st.success(f"Best Model: **{best}** – AUC = {metrics_df.loc[best, 'AUC']:.3f}")
+best_model_name = metrics_df['AUC'].idxmax()
+st.success(f"🏆 Best Model: **{best_model_name}** (AUC = {metrics_df.loc[best_model_name, 'AUC']:.4f})")
 
+# Plots
 col1, col2 = st.columns(2)
+
 with col1:
     st.subheader("ROC Curves")
-    fig, ax = plt.subplots()
-    for name, prob in predictions.items():
-        fpr, tpr, _ = roc_curve(y_test, prob)
-        ax.plot(fpr, tpr, label=f"{name} ({results[name]['AUC']:.3f})")
-    ax.plot([0,1],[0,1],'k--')
-    ax.set_xlabel("False Positive Rate")
-    ax.set_ylabel("True Positive Rate")
+    fig, ax = plt.subplots(figsize=(8,6))
+    for name, pred in predictions.items():
+        ax.plot(pred['fpr'], pred['tpr'], label=f"{name} (AUC = {results[name]['AUC']:.3f})")
+    ax.plot([0,1], [0,1], 'k--', label='Random')
+    ax.set_xlabel('False Positive Rate')
+    ax.set_ylabel('True Positive Rate')
     ax.legend()
+    ax.grid(alpha=0.3)
+    st.pyplot(fig)
+
+    st.subheader("Precision-Recall Curves")
+    fig, ax = plt.subplots(figsize=(8,6))
+    for name, pred in predictions.items():
+        ax.plot(pred['recall'], pred['precision'], label=f"{name} (AP = {average_precision_score(y_test, pred['prob']):.3f})")
+    ax.set_xlabel('Recall')
+    ax.set_ylabel('Precision')
+    ax.legend()
+    ax.grid(alpha=0.3)
     st.pyplot(fig)
 
 with col2:
-    st.subheader("Top Features (Best Tree Model)")
-    if "Random" in best or "Gradient" in best:
-        pipe = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler()),
-            ('model', models[best])
-        ])
-        pipe.fit(X_train, y_train)
-        imp = pd.DataFrame({'Feature': X.columns, 'Importance': pipe.named_steps['model'].feature_importances_})
-        imp = imp.sort_values('Importance', ascending=False).head(10)
-        fig, ax = plt.subplots()
-        sns.barplot(data=imp, x='Importance', y='Feature', palette="viridis")
-        st.pyplot(fig)
+    st.subheader(f"Confusion Matrix — {best_model_name}")
+    cm = confusion_matrix(y_test, predictions[best_model_name]['pred'])
+    fig, ax = plt.subplots(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                xticklabels=['No Readmit', 'Readmit'],
+                yticklabels=['No Readmit', 'Readmit'])
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Actual')
+    st.pyplot(fig)
 
-st.download_button("Download Results", metrics_df.to_csv(), "readmission_results.csv")
+    st.subheader("Random Forest Feature Importance")
+    # Always show Random Forest importance (most interpretable tree model)
+    rf_pipe = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler()),
+        ('model', RandomForestClassifier(n_estimators=100, random_state=42))
+    ])
+    rf_pipe.fit(X_train, y_train)
+    importances = rf_pipe.named_steps['model'].feature_importances_
+    imp_df = pd.DataFrame({'Feature': X.columns, 'Importance': importances})
+    imp_df = imp_df.sort_values('Importance', ascending=False).head(10)
+    
+    fig, ax = plt.subplots(figsize=(8,6))
+    sns.barplot(data=imp_df, x='Importance', y='Feature', palette='viridis', ax=ax)
+    ax.set_title("Top 10 Features (Random Forest)")
+    st.pyplot(fig)
+
+# Download
+st.download_button("Download Full Metrics", metrics_df.to_csv(), "readmission_full_metrics.csv")
 st.balloons()
