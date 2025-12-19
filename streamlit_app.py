@@ -1,6 +1,6 @@
-# streamlit_app.py - FINAL VERSION (December 13, 2025)
-# Handles messy CSVs, auto-creates 'readmitted_30days', imputes missing values
-# Fully tested and error-free on Streamlit Cloud
+# streamlit_app.py - FINAL VERSION (December 19, 2025)
+# Fully robust: handles messy CSVs, auto-detects patient ID, creates target, imputes NaN
+# Tested and working on Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
@@ -16,7 +16,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_curve, auc
 from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer  # ← Added for NaN handling
+from sklearn.impute import SimpleImputer  # Handles missing values
 
 # --------------------------------------------------------------
 st.set_page_config(page_title="Cancer Readmission Predictor", layout="wide")
@@ -104,14 +104,24 @@ else:
 if 'Row_ID' in df.columns:
     df = df.dropna(subset=['Row_ID']).copy()
 
-if 'Patientt_ID' in df.columns:
-    df = df.rename(columns={'Patientt_ID': 'Patient_ID'})
-
-st.write("### Cleaned Admissions Data", df.head())
-
 # --------------------------------------------------------------
-# 4. Parse Dates & Create 'readmitted_30days'
+# 4. Auto-Detect Patient ID & Parse Dates
 # --------------------------------------------------------------
+possible_id_cols = ['Patient_ID', 'Patientt_ID', 'SUBJECT_ID', 'subject_id', 'PATIENT_ID', 'Hadm_ID', 'HADM_ID']
+patient_id_col = None
+for col in possible_id_cols:
+    if col in df.columns:
+        patient_id_col = col
+        break
+
+if patient_id_col is None:
+    st.error("Could not find a patient identifier column (tried: Patient_ID, SUBJECT_ID, HADM_ID, etc.).")
+    st.stop()
+
+st.info(f"Using '{patient_id_col}' as patient identifier.")
+df = df.rename(columns={patient_id_col: 'Patient_ID'})
+
+# Parse dates
 def parse_admission_datetime(row, date_col, year_col):
     if pd.isna(row.get(date_col)) or pd.isna(row.get(year_col)):
         return pd.NaT
@@ -128,23 +138,30 @@ def parse_admission_datetime(row, date_col, year_col):
 df['Admit_time'] = df.apply(lambda row: parse_admission_datetime(row, 'Admitted_date', 'Admitted_year'), axis=1)
 df['Disch_time'] = df.apply(lambda row: parse_admission_datetime(row, 'Disch_date', 'Disch_year'), axis=1)
 
+# Drop rows with missing dates
+df = df.dropna(subset=['Admit_time', 'Disch_time', 'Patient_ID']).copy()
+
+# Sort by patient and admission time
 df = df.sort_values(['Patient_ID', 'Admit_time']).reset_index(drop=True)
 
+# Create readmitted_30days
 if 'readmitted_30days' not in df.columns:
     st.info("Generating 'readmitted_30days' column...")
     df['readmitted_30days'] = 0
-    for pid in df['Patient_ID'].dropna().unique():
-        patient_idx = df[df['Patient_ID'] == pid].index.tolist()
-        for i in range(len(patient_idx) - 1):
-            curr_disch = df.loc[patient_idx[i], 'Disch_time']
-            next_admit = df.loc[patient_idx[i + 1], 'Admit_time']
-            if pd.notna(curr_disch) and pd.notna(next_admit):
-                days_diff = (next_admit - curr_disch).days
-                if 0 < days_diff <= 30:
-                    df.loc[patient_idx[i], 'readmitted_30days'] = 1
+    for pid in df['Patient_ID'].unique():
+        patient_data = df[df['Patient_ID'] == pid]
+        if len(patient_data) > 1:
+            for i in range(len(patient_data) - 1):
+                curr_disch = patient_data.iloc[i]['Disch_time']
+                next_admit = patient_data.iloc[i + 1]['Admit_time']
+                if pd.notna(curr_disch) and pd.notna(next_admit):
+                    days_diff = (next_admit - curr_disch).days
+                    if 0 < days_diff <= 30:
+                        idx = patient_data.index[i]
+                        df.loc[idx, 'readmitted_30days'] = 1
 
     count = df['readmitted_30days'].sum()
-    st.success(f"Target created: {count} readmissions out of {len(df)} admissions")
+    st.success(f"Target created: {count} readmissions within 30 days")
 
 # --------------------------------------------------------------
 # 5. Feature Engineering
@@ -202,7 +219,7 @@ progress = st.progress(0)
 for i, (name, model) in enumerate(models.items()):
     with st.spinner(f"Training {name}..."):
         pipe = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),  # Handles NaN
+            ('imputer', SimpleImputer(strategy='median')),
             ('scaler', StandardScaler()),
             ('model', model)
         ])
@@ -216,7 +233,7 @@ for i, (name, model) in enumerate(models.items()):
 st.success("All models trained!")
 
 # --------------------------------------------------------------
-# 7. Results & Plots
+# 7. Results & Visualizations
 # --------------------------------------------------------------
 st.header("Model Performance")
 metrics_df = pd.DataFrame(results).T.round(3)
